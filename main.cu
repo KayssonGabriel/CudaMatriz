@@ -3,6 +3,11 @@
 #include <ctime>
 #include <chrono>
 #include <iomanip> // Para std::setprecision
+#include <limits>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <vector>
 #include <cuda_runtime.h>
 
 // Função de multiplicação paralela na GPU
@@ -25,34 +30,45 @@ void fillMatrix(float* matrix, int N) {
     }
 }
 
-int main() {
-    srand(time(0));
+void verificarCuda(cudaError_t status, const char* operacao) {
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string(operacao) + ": " + cudaGetErrorString(status));
+    }
+}
+
+using MatrizCuda = std::unique_ptr<float, decltype(&cudaFree)>;
+
+MatrizCuda alocarMatriz(size_t bytes) {
+    float* matriz = nullptr;
+    verificarCuda(cudaMalloc(&matriz, bytes), "alocar matriz CUDA");
+    return MatrizCuda(matriz, cudaFree);
+}
+
+int main() try {
+    srand(time(nullptr));
 
     // Solicitar o tamanho da matriz ao usuário
     int N;
     std::cout << "Digite o tamanho da matriz (NxN): ";
-    std::cin >> N;
+    if (!(std::cin >> N) || N <= 0
+            || N > std::numeric_limits<int>::max() / N) {
+        throw std::invalid_argument("Informe uma dimensão inteira positiva compatível com os índices da matriz.");
+    }
 
-    size_t bytes = N * N * sizeof(float);
+    size_t elementos = static_cast<size_t>(N) * N;
+    size_t bytes = elementos * sizeof(float);
 
-    // Alocação de memória para as matrizes no host (CPU)
-    float* h_A = (float*)malloc(bytes);
-    float* h_B = (float*)malloc(bytes);
-    float* h_C_parallel = (float*)malloc(bytes); // Resultado Paralelo
+    std::vector<float> h_A(elementos);
+    std::vector<float> h_B(elementos);
+    std::vector<float> h_C_parallel(elementos);
+    fillMatrix(h_A.data(), N);
+    fillMatrix(h_B.data(), N);
 
-    // Preencher as matrizes A e B com números aleatórios
-    fillMatrix(h_A, N);
-    fillMatrix(h_B, N);
-
-    // Alocação de memória na GPU
-    float *d_A, *d_B, *d_C;
-    cudaMalloc(&d_A, bytes);
-    cudaMalloc(&d_B, bytes);
-    cudaMalloc(&d_C, bytes);
-
-    // Copiar dados do host (CPU) para o dispositivo (GPU)
-    cudaMemcpy(d_A, h_A, bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_B, h_B, bytes, cudaMemcpyHostToDevice);
+    auto d_A = alocarMatriz(bytes);
+    auto d_B = alocarMatriz(bytes);
+    auto d_C = alocarMatriz(bytes);
+    verificarCuda(cudaMemcpy(d_A.get(), h_A.data(), bytes, cudaMemcpyHostToDevice), "enviar matriz A");
+    verificarCuda(cudaMemcpy(d_B.get(), h_B.data(), bytes, cudaMemcpyHostToDevice), "enviar matriz B");
 
     // Definir dimensões da grade e blocos para a execução na GPU
     int BLOCK_SIZE = 16;
@@ -61,25 +77,21 @@ int main() {
 
     // Multiplicação Paralela
     auto start_parallel = std::chrono::high_resolution_clock::now();
-    matrixMultiplyParallel<<<blocks, threads>>>(d_A, d_B, d_C, N);
-    cudaDeviceSynchronize(); // Garantir que a execução esteja completa
+    matrixMultiplyParallel<<<blocks, threads>>>(d_A.get(), d_B.get(), d_C.get(), N);
+    verificarCuda(cudaGetLastError(), "lançar multiplicação CUDA");
+    verificarCuda(cudaDeviceSynchronize(), "executar multiplicação CUDA");
     auto end_parallel = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> time_parallel = end_parallel - start_parallel;
 
     // Copiar o resultado de volta para o host (CPU)
-    cudaMemcpy(h_C_parallel, d_C, bytes, cudaMemcpyDeviceToHost);
+    verificarCuda(cudaMemcpy(h_C_parallel.data(), d_C.get(), bytes, cudaMemcpyDeviceToHost), "receber matriz C");
 
     // Imprimir os resultados em segundos com 6 casas decimais
     std::cout << std::fixed << std::setprecision(6);
     std::cout << "Tempo Paralelo: " << time_parallel.count() << " segundos\n";
 
-    // Liberar memória
-    free(h_A);
-    free(h_B);
-    free(h_C_parallel);
-    cudaFree(d_A);
-    cudaFree(d_B);
-    cudaFree(d_C);
-
     return 0;
+} catch (const std::exception& erro) {
+    std::cerr << erro.what() << std::endl;
+    return 1;
 }
